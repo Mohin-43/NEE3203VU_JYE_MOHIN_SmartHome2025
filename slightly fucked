@@ -1,0 +1,205 @@
+#include <Arduino.h>
+#include <Wire.h>
+#include <Adafruit_NeoPixel.h>
+#include <IRremote.hpp>
+#include <Adafruit_GFX.h>
+#include <Adafruit_EPD.h>
+
+// === Pin Assignments ===
+#define PIN_FAN        6
+#define PIN_DISTANCE   A4
+#define PIN_STICK      5
+#define PIN_RING       3
+#define PIN_IR         2
+#define PIN_POT        A0
+
+// === ePaper Pins ===
+#define EPD_CS   10
+#define EPD_DC   8
+#define EPD_RST  9
+#define EPD_BUSY 7
+
+// === Display Driver ===
+Adafruit_SSD1681 display(200, 200, EPD_DC, EPD_RST, EPD_CS, -1, EPD_BUSY);
+
+// === NeoPixel Setup ===
+Adafruit_NeoPixel ledStick(8, PIN_STICK, NEO_GRB + NEO_KHZ800);
+Adafruit_NeoPixel ledRing(16, PIN_RING, NEO_GRB + NEO_KHZ800);
+
+// === Global Variables ===
+int potValue = 0;
+int fanSpeed = 0;
+bool allOn = false;
+bool flashing = false;
+bool colorCycle = false;
+unsigned long lastFlashTime = 0;
+unsigned long lastColorTime = 0;
+unsigned long lastEPaperUpdate = 0;
+int flashState = 0;
+int colorIndex = 0;
+uint32_t colors[] = {
+  ledRing.Color(255, 0, 0),
+  ledRing.Color(0, 255, 0),
+  ledRing.Color(0, 0, 255),
+  ledRing.Color(255, 255, 0),
+  ledRing.Color(0, 255, 255),
+  ledRing.Color(255, 0, 255),
+  ledRing.Color(255, 255, 255)
+};
+
+// === IR Remote Codes ===
+#define IR_ON_ALL     0x45
+#define IR_OFF_ALL    0x40
+#define IR_FLASH      0x0C
+#define IR_COLOR      0x18
+
+// === Distance sensor timing ===
+unsigned long lastDistanceUpdate = 0;
+const unsigned long distanceInterval = 1000; // 1 second between reads
+
+// === Helper Functions ===
+void setAllLEDs(uint32_t color) {
+  for (int i = 0; i < ledStick.numPixels(); i++) ledStick.setPixelColor(i, color);
+  ledStick.show();
+  for (int i = 0; i < ledRing.numPixels(); i++) ledRing.setPixelColor(i, color);
+  ledRing.show();
+}
+
+void clearAllLEDs() {
+  ledStick.clear();
+  ledStick.show();
+  ledRing.clear();
+  ledRing.show();
+}
+
+void handleIR() {
+  if (IrReceiver.decode()) {
+    unsigned long code = IrReceiver.decodedIRData.decodedRawData;
+    Serial.print("IR Code: 0x");
+    Serial.println(code, HEX);
+
+    if (code == IR_ON_ALL) {
+      allOn = true;
+      flashing = false;
+      colorCycle = false;
+      setAllLEDs(ledRing.Color(255, 255, 255));
+    } 
+    else if (code == IR_OFF_ALL) {
+      allOn = false;
+      flashing = false;
+      colorCycle = false;
+      clearAllLEDs();
+    } 
+    else if (code == IR_FLASH) {
+      flashing = true;
+      colorCycle = false;
+    } 
+    else if (code == IR_COLOR) {
+      colorCycle = true;
+      flashing = false;
+    }
+
+    IrReceiver.resume();
+  }
+}
+
+void updateLEDs() {
+  if (flashing && millis() - lastFlashTime > 100) { 
+    lastFlashTime = millis();
+    flashState = !flashState;
+    if (flashState) setAllLEDs(ledRing.Color(255, 255, 255));
+    else clearAllLEDs();
+  }
+
+  if (colorCycle && millis() - lastColorTime > 500) {
+    lastColorTime = millis();
+    colorIndex = (colorIndex + 1) % (sizeof(colors) / sizeof(colors[0]));
+    setAllLEDs(colors[colorIndex]);
+  }
+}
+
+void updateFanControl() {
+  potValue = analogRead(PIN_POT);
+  fanSpeed = map(potValue, 0, 1023, 0, 255);
+  analogWrite(PIN_FAN, fanSpeed);
+
+  int percent = map(fanSpeed, 0, 255, 0, 100);
+  Serial.print("Pot: ");
+  Serial.print(potValue);
+  Serial.print(" | Fan: ");
+  Serial.print(percent);
+  Serial.println("%");
+
+  // Slow down ePaper updates to once every 5 seconds
+  if (millis() - lastEPaperUpdate > 5000) {
+    lastEPaperUpdate = millis();
+
+    display.clearBuffer();
+    display.setTextSize(1);
+    display.setTextColor(EPD_BLACK);
+    display.setCursor(10, 40);
+    display.print("Fan Speed: ");
+    display.print(percent);
+    display.println("%");
+
+    display.setCursor(10, 60);
+    display.print("Pot Value: ");
+    display.print(potValue);
+
+    display.display();
+    delay(2000); // give ePaper time to refresh
+  }
+}
+
+void updateDistanceSensor() {
+  int raw = analogRead(PIN_DISTANCE);
+  float voltage = raw * (5.0 / 1023.0);
+  float distance = 27.86 * pow(voltage, -1.15);  // empirical fit for Sharp GP2Y0A21YK
+  Serial.print("Raw: ");
+  Serial.print(raw);
+  Serial.print(" | Voltage: ");
+  Serial.print(voltage, 2);
+  Serial.print(" V | Distance: ");
+  Serial.print(distance, 1);
+  Serial.println(" cm");
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  // NeoPixels
+  ledStick.begin();
+  ledStick.show();
+  ledRing.begin();
+  ledRing.show();
+
+  // IR Receiver
+  IrReceiver.begin(PIN_IR, ENABLE_LED_FEEDBACK);
+
+  // ePaper
+  display.begin();
+  display.clearBuffer();
+  display.setTextColor(EPD_BLACK);
+  display.setTextSize(1);
+  display.setCursor(10, 40);
+  display.println("Smart Home Ready");
+  display.display();
+  delay(2000);
+
+  // Fan
+  pinMode(PIN_FAN, OUTPUT);
+}
+
+void loop() {
+  handleIR();
+  updateLEDs();
+  updateFanControl();
+
+  // Slow distance sensor updates to once per second
+  if (millis() - lastDistanceUpdate > 1000) {
+    lastDistanceUpdate = millis();
+    updateDistanceSensor();
+  }
+
+  delay(50); // keeps loop lightweight
+}
