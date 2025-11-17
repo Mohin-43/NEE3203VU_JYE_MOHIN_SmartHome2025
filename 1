@@ -1,0 +1,270 @@
+#include <Adafruit_NeoPixel.h>
+#include <SPI.h>
+#include <Wire.h>
+#include "epd1in54_V2.h"
+#include "imagedata.h"
+#include "epdpaint.h"
+#include <stdio.h>
+#include <Adafruit_Sensor.h>
+#include "Adafruit_BME680.h"
+#include "SparkFun_VEML6030_Ambient_Light_Sensor.h"
+#include "DFRobot_INA219.h"
+#include <SparkFun_MAX1704x_Fuel_Gauge_Arduino_Library.h>
+#include <math.h>
+#include <IRremote.hpp>
+
+// -------------------- Pins & addresses --------------------
+#define PWM_PIN 6
+#define TACH_PIN 4
+#define POT_PIN A0
+#define DISTANCE_PIN A4
+#define GLOW_BIT_PIN 5
+#define RING_PIN 3
+#define IR_PIN 2
+#define AL_ADDR 0x48
+#define POT_MAX_OHMS 50000.0
+
+// -------------------- IR codes --------------------
+#define IR_POWER_TOGGLE     0x45
+#define IR_RING_LIGHT_SHOW  0x4A
+#define IR_RING_GREEN       0x0C
+#define IR_RING_OFF         0x18
+#define IR_BRIGHTNESS_CYCLE 0x5E // START flash
+#define IR_RING_RED         0x08
+#define IR_RING_BLUE        0x1C
+#define IR_RING_PURPLE      0x5A
+#define IR_STOP_FLASH       0x42 // Dedicated STOP flash button
+
+// -------------------- NeoPixel setup --------------------
+#define LED_COUNT 8
+Adafruit_NeoPixel glowBit(LED_COUNT, GLOW_BIT_PIN, NEO_GRB + NEO_KHZ800);
+
+#define RING_COUNT 16
+Adafruit_NeoPixel ledRing(RING_COUNT, RING_PIN, NEO_GRB + NEO_KHZ800);
+
+// -------------------- E-paper (Waveshare) --------------------
+Epd epd;
+unsigned char image[1024], blankBase[5000];
+Paint paint(image, 0, 0);
+#define COLORED 0
+#define UNCOLORED 1
+
+// -------------------- Sensors --------------------
+SparkFun_Ambient_Light light(AL_ADDR);
+Adafruit_BME680 bme(&Wire1);
+DFRobot_INA219_IIC ina219(&Wire1, INA219_I2C_ADDRESS4);
+SFE_MAX1704X fuelGauge(MAX1704X_MAX17048);
+
+// -------------------- Sensor variables --------------------
+float gain = .25, temperature = 0, humidity = 0, pressure = 0, gasResistance = 0;
+float batteryVoltage = 0, batterySOC = 0, batteryChangeRate = 0;
+float busVoltage = 0, shuntVoltage = 0, current_mA = 0, power_mW = 0, totalEnergy_mWh = 0;
+long luxVal = 0;
+long distance = -1;
+int Integtime = 700, potValue = 0, fanSpeed = 0, updateCount = 0;
+float potOhms = 0;
+bool ina219Ready = false, fuelGaugeReady = false, lightReady = false, ledState = false;
+int previousFanSpeed = 0;
+
+// -------------------- System state --------------------
+bool systemPowerOn = true; // master power toggle (fan, stick, ring)
+
+// -------------------- Ring state --------------------
+#define RING_MODE_OFF       0
+#define RING_MODE_STATIC     1
+#define RING_MODE_LIGHT_SHOW 2
+
+int ringMode = RING_MODE_OFF;
+uint32_t ringActiveColor = 0;
+uint8_t currentBrightness = 255;
+
+// FLASHING (independent state)
+bool ringFlashing = false;
+bool ringFlashState = true;
+unsigned long lastFlashMicros = 0;
+const unsigned long FLASH_TOGGLE_US = 17000UL; // ~30 Hz
+
+// Static 7-color rainbow palette
+uint32_t rainbowPalette7[7];
+
+// -------------------- Timing --------------------
+unsigned long lastSensorRead = 0;
+unsigned long lastEPaperUpdate = 0;
+unsigned long lastLightShowUpdate = 0;
+unsigned long lastDistanceSerial = 0;
+unsigned long lastIRPrint = 0;
+
+const unsigned long SENSOR_INTERVAL = 100;
+const unsigned long EPAPER_INTERVAL = 3000;
+const unsigned long LIGHTSHOW_STEP_MS = 50;
+const unsigned long DISTANCE_PRINT_MS = 200;
+const unsigned long IR_PRINT_DEBOUNCE_MS = 80;
+const int DISTANCE_RAW_NO_OBJECT_THRESHOLD = 10;
+const unsigned long fullRefreshCycle = 20;
+
+// -------------------- Forward declarations --------------------
+void scanI2C();
+void readFanControl();
+void readSensors();
+long readDistance();
+void clearStick();
+void setStickColor(uint32_t color);
+void clearRing();
+void setRingColor(uint32_t color);
+void handleIR();
+void updateRingLEDs();
+void updateDistanceLEDs();
+void displayLine(int &yPos, const char* text, bool partial=false);
+void displayFullScreen();
+void updateDisplayPartial();
+uint32_t Wheel(byte WheelPos);
+
+// -------------------- Utility / I2C scan --------------------
+void scanI2C() {
+  int nDevices = 0;
+  Serial.println("Scanning I2C bus...");
+  for(byte address = 1; address < 127; address++) {
+    Wire1.beginTransmission(address);
+    if (Wire1.endTransmission() == 0) {
+      Serial.print("  Device found at 0x");
+      if (address < 16) Serial.print("0");
+      Serial.println(address, HEX);
+      nDevices++;
+    }
+  }
+  if (nDevices == 0) Serial.println("  No I2C devices found!");
+  else { Serial.print("  "); Serial.print(nDevices); Serial.println(" device(s) found."); }
+}
+
+uint32_t Wheel(byte WheelPos) {
+  WheelPos = 255 - WheelPos;
+  if(WheelPos < 85) return ledRing.Color(255 - WheelPos * 3, 0, WheelPos * 3);
+  if(WheelPos < 170) { WheelPos -= 85; return ledRing.Color(0, WheelPos * 3, 255 - WheelPos * 3); }
+  WheelPos -= 170;
+  return ledRing.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
+}
+
+// -------------------- NeoPixel helpers --------------------
+void clearStick() { glowBit.clear(); glowBit.show(); }
+void setStickColor(uint32_t color) { for(int i=0;i<LED_COUNT;i++) glowBit.setPixelColor(i,color); glowBit.show(); }
+void clearRing() { ledRing.clear(); ledRing.show(); }
+void setRingColor(uint32_t color) { for(int i=0;i<RING_COUNT;i++) ledRing.setPixelColor(i,color); ledRing.setBrightness(currentBrightness); ledRing.show(); }
+
+// -------------------- IR handling --------------------
+void handleIR() {
+  if (IrReceiver.decode()) {
+    unsigned long code = IrReceiver.decodedIRData.command;
+    static unsigned long lastCodePrinted = 0;
+    static unsigned long lastCodeValue = 0xFFFFFFFF;
+    if (code != lastCodeValue || millis() - lastCodePrinted > IR_PRINT_DEBOUNCE_MS) {
+      Serial.print("IR: 0x");
+      Serial.println(code, HEX);
+      lastCodeValue = code;
+      lastCodePrinted = millis();
+    }
+
+    switch(code) {
+      case IR_POWER_TOGGLE:
+        systemPowerOn = !systemPowerOn;
+        if (!systemPowerOn) { previousFanSpeed = fanSpeed; fanSpeed=0; analogWrite(PWM_PIN,0); clearStick(); clearRing(); }
+        else { fanSpeed = previousFanSpeed; analogWrite(PWM_PIN,fanSpeed); }
+        break;
+      case IR_RING_OFF:
+      case IR_STOP_FLASH:
+        ringMode = RING_MODE_OFF; clearRing(); ringFlashing = false; fanSpeed = 0; analogWrite(PWM_PIN,0); clearStick();
+        break;
+      case IR_RING_GREEN: ringActiveColor=ledRing.Color(0,255,0); ringMode=RING_MODE_STATIC; break;
+      case IR_RING_RED: ringActiveColor=ledRing.Color(255,0,0); ringMode=RING_MODE_STATIC; break;
+      case IR_RING_BLUE: ringActiveColor=ledRing.Color(0,0,255); ringMode=RING_MODE_STATIC; break;
+      case IR_RING_PURPLE: ringActiveColor=ledRing.Color(255,0,255); ringMode=RING_MODE_STATIC; break;
+      case IR_RING_LIGHT_SHOW: ringMode=RING_MODE_LIGHT_SHOW; break;
+      case IR_BRIGHTNESS_CYCLE: ringFlashing=!ringFlashing; ringFlashState=true; lastFlashMicros=micros(); break;
+      default: break;
+    }
+    IrReceiver.resume();
+  }
+}
+
+// -------------------- Ring update --------------------
+void updateRingLEDs() {
+  unsigned long nowMicros = micros();
+  if (!systemPowerOn) { ringMode=RING_MODE_OFF; clearRing(); return; }
+  if (ringFlashing && nowMicros-lastFlashMicros>=FLASH_TOGGLE_US) { lastFlashMicros+=FLASH_TOGGLE_US; ringFlashState=!ringFlashState; }
+  else if(!ringFlashing) ringFlashState=true;
+
+  if (ringMode==RING_MODE_STATIC) { if(ringFlashState) setRingColor(ringActiveColor); else clearRing(); }
+  else if (ringMode==RING_MODE_LIGHT_SHOW) {
+    if (ringFlashState) { for(int i=0;i<RING_COUNT;i++) ledRing.setPixelColor(i,rainbowPalette7[i%7]); ledRing.setBrightness(currentBrightness); ledRing.show(); }
+    else clearRing();
+  } else clearRing();
+}
+
+// -------------------- Distance sensor --------------------
+long readDistance() {
+  int raw = analogRead(DISTANCE_PIN);
+  if(raw<10) return -1;
+  float voltage = raw*(5.0/1023.0);
+  long d = 27.86*pow(voltage,-1.15);
+  if(d>100)d=100;
+  return d;
+}
+void updateDistanceLEDs() {
+  if(!systemPowerOn){clearStick(); return;}
+  distance = readDistance();
+  if(millis()-lastDistanceSerial>=DISTANCE_PRINT_MS){ lastDistanceSerial=millis(); Serial.print("Distance: "); Serial.println(distance<0?"none":String(distance)); }
+  clearStick();
+  uint32_t color=glowBit.Color(255,200,50);
+  if(distance>=14 && distance<=20){ glowBit.setPixelColor(0,color); glowBit.setPixelColor(1,color); glowBit.setPixelColor(6,color); glowBit.setPixelColor(7,color); }
+  else if(distance>=10 && distance<14){ for(int i=0;i<LED_COUNT;i++) glowBit.setPixelColor(i,color); }
+  glowBit.show();
+}
+
+// -------------------- Fan & sensors --------------------
+void readFanControl(){ potValue=analogRead(POT_PIN); potOhms=(potValue/1023.0)*POT_MAX_OHMS; if(systemPowerOn){ fanSpeed=map(potValue,0,1023,0,255); previousFanSpeed=fanSpeed; } else fanSpeed=0; analogWrite(PWM_PIN,fanSpeed);}
+void readSensors(){
+  luxVal=lightReady?light.readLight():0;
+  if(bme.performReading()){ temperature=bme.temperature; humidity=bme.humidity; pressure=bme.pressure/100.0; gasResistance=bme.gas_resistance/1000.0; }
+  if(fuelGaugeReady){ batteryVoltage=fuelGauge.getVoltage(); batterySOC=fuelGauge.getSOC(); batteryChangeRate=fuelGauge.getChangeRate(); }
+  if(ina219Ready){ busVoltage=ina219.getBusVoltage_V(); shuntVoltage=ina219.getShuntVoltage_mV(); current_mA=ina219.getCurrent_mA(); power_mW=ina219.getPower_mW(); }
+}
+
+// -------------------- E-paper --------------------
+void displayLine(int &yPos,const char* text,bool partial){ paint.SetWidth(200); paint.SetHeight(16); paint.Clear(UNCOLORED); paint.DrawStringAt(5,0,text,&Font12,COLORED); if(partial) epd.SetFrameMemoryPartial(paint.GetImage(),0,yPos,paint.GetWidth(),paint.GetHeight()); else epd.SetFrameMemory(paint.GetImage(),0,yPos,paint.GetWidth(),paint.GetHeight()); yPos+=16;}
+void displayFullScreen(){ char buf[64]; int yPos=0; paint.SetWidth(200); paint.SetHeight(20); paint.Clear(COLORED); paint.DrawStringAt(5,2,"Smart LED Monitor",&Font12,UNCOLORED); epd.SetFrameMemory(paint.GetImage(),0,yPos,paint.GetWidth(),paint.GetHeight()); yPos=22; sprintf(buf,"Temp: %.1fC",temperature); displayLine(yPos,buf,false); sprintf(buf,"Humid: %.1f%%",humidity); displayLine(yPos,buf,false); sprintf(buf,"Press: %.0fhPa",pressure); displayLine(yPos,buf,false); sprintf(buf,"Light: %ldLux",luxVal); displayLine(yPos,buf,false); sprintf(buf,"Dist: %ldcm",distance); displayLine(yPos,buf,false); yPos+=2; sprintf(buf,"--- Fan ---"); displayLine(yPos,buf,false); sprintf(buf,"Speed: %d%%",map(fanSpeed,0,255,0,100)); displayLine(yPos,buf,false); sprintf(buf,potOhms>=1000?"Pot: %.1fkOhm":"Pot: %.0fOhm",potOhms>=1000?potOhms/1000.0:potOhms); displayLine(yPos,buf,false); yPos+=2; sprintf(buf,"--- Power ---"); displayLine(yPos,buf,false); if(fuelGaugeReady){ sprintf(buf,"Batt: %.1f%%",batterySOC); displayLine(yPos,buf,false); sprintf(buf,"BatV: %.2fV",batteryVoltage); displayLine(yPos,buf,false);} if(ina219Ready){ sprintf(buf,"Curr: %.1fmA",current_mA); displayLine(yPos,buf,false); sprintf(buf,"Powr: %.1fmW",power_mW); displayLine(yPos,buf,false);} epd.DisplayFrame();}
+void updateDisplayPartial(){ char buf[64]; int yPos=22; paint.SetWidth(200); paint.SetHeight(16); sprintf(buf,"Temp: %.1fC",temperature); displayLine(yPos,buf,true); sprintf(buf,"Humid: %.1f%%",humidity); displayLine(yPos,buf,true); sprintf(buf,"Press: %.0fhPa",pressure); displayLine(yPos,buf,true); sprintf(buf,"Light: %ldLux",luxVal); displayLine(yPos,buf,true); sprintf(buf,"Dist: %ldcm",distance); displayLine(yPos,buf,true); epd.DisplayPartFrame();}
+
+// -------------------- Setup --------------------
+void setup() {
+  Serial.begin(115200);
+  while(!Serial && millis()<3000) delay(10);
+  glowBit.begin(); glowBit.show(); glowBit.setBrightness(100);
+  ledRing.begin(); ledRing.show(); ledRing.setBrightness(currentBrightness);
+  pinMode(PWM_PIN,OUTPUT); pinMode(TACH_PIN,INPUT_PULLUP); pinMode(LED_BUILTIN,OUTPUT);
+  pinMode(POT_PIN,INPUT); pinMode(GLOW_BIT_PIN,OUTPUT); pinMode(RING_PIN,OUTPUT);
+  IrReceiver.begin(IR_PIN);
+  Wire1.begin(); delay(500);
+  scanI2C();
+  if(light.begin(Wire1)) { lightReady=true; light.setGain(gain); light.setIntegTime(Integtime); }
+  if(bme.begin()){ bme.setTemperatureOversampling(BME680_OS_8X); bme.setHumidityOversampling(BME680_OS_2X); bme.setPressureOversampling(BME680_OS_4X); bme.setIIRFilterSize(BME680_FILTER_SIZE_3); bme.setGasHeater(320,150); }
+  int retryCount=0; while(!ina219.begin() && retryCount<5){ delay(1000); retryCount++; }
+  if(retryCount<5){ ina219.linearCalibrate(1000,1000); ina219Ready=true; }
+  if(fuelGauge.begin(Wire1)){ fuelGaugeReady=true; fuelGauge.quickStart(); delay(200); fuelGauge.setThreshold(10); }
+
+  rainbowPalette7[0]=ledRing.Color(255,0,0); rainbowPalette7[1]=ledRing.Color(255,96,0); rainbowPalette7[2]=ledRing.Color(255,255,0);
+  rainbowPalette7[3]=ledRing.Color(0,255,0); rainbowPalette7[4]=ledRing.Color(0,255,255); rainbowPalette7[5]=ledRing.Color(0,0,255); rainbowPalette7[6]=ledRing.Color(255,0,255);
+
+  epd.LDirInit(); epd.Clear();
+  readSensors(); readFanControl(); displayFullScreen(); delay(1000);
+  epd.HDirInit(); memset(blankBase,0xFF,sizeof(blankBase)); epd.DisplayPartBaseImage(blankBase);
+  lastSensorRead=lastEPaperUpdate=lastLightShowUpdate=lastDistanceSerial=millis();
+  lastFlashMicros=micros();
+}
+
+// -------------------- Main loop --------------------
+void loop(){
+  unsigned long nowMillis=millis(); unsigned long nowMicros=micros();
+  handleIR();
+  if(nowMillis-lastSensorRead>=SENSOR_INTERVAL){ lastSensorRead=nowMillis; readSensors(); readFanControl(); updateDistanceLEDs(); }
+  updateRingLEDs();
+  if(nowMillis-lastEPaperUpdate>=EPAPER_INTERVAL){ lastEPaperUpdate=nowMillis; if(updateCount%fullRefreshCycle==0) displayFullScreen(); else updateDisplayPartial(); updateCount++; }
+}
